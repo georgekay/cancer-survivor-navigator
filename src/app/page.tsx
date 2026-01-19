@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 // IMPORTANT:
 // - If your Supabase client lives at "@/supabase" instead, change the import below.
 import { supabase } from "@/lib/supabase";
@@ -58,22 +57,14 @@ type ResourceMatch = {
   source_url: string | null;
   match_rank: number;
   link_strength?: number;
+  // new fields (patch v1)
+  is_locator?: boolean;
+  requires_zip?: boolean;
+  website_template?: string | null;
+  priority?: number;
 };
 
-const TX_REGIONS = [
-  "Houston Metro",
-  "DFW",
-  "Austin",
-  "San Antonio",
-  "El Paso",
-  "Rio Grande Valley",
-  "Coastal Bend",
-  "West Texas",
-  "Panhandle",
-  "Other/Unknown",
-] as const;
-
-type TxRegion = (typeof TX_REGIONS)[number];
+type FeedbackIssue = "wrong_phone" | "broken_link" | "not_eligible" | "closed" | "other";
 
 type CategoryKey = "bills_coverage" | "meds" | "transport";
 
@@ -89,10 +80,35 @@ function normalizePhoneForTel(phone: string): string | null {
   return cleaned.startsWith("+") ? cleaned : `+1${cleaned}`;
 }
 
-function rankPill(rank: number, lang: Lang) {
+function safeEncode(s: string) {
+  try {
+    return encodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+function buildWebsiteUrl(
+  r: ResourceMatch,
+  ctx: { county: string; region: string; zip: string },
+): string | null {
+  const tpl = (r.website_template ?? "").trim();
+  if (tpl) {
+    return tpl
+      .replaceAll("{county}", safeEncode(ctx.county))
+      .replaceAll("{region}", safeEncode(ctx.region))
+      .replaceAll("{zip}", safeEncode(ctx.zip));
+  }
+  return r.website_url;
+}
+
+function rankPill(r: ResourceMatch, lang: Lang) {
+  // If DB marks this as a locator, label it clearly.
+  if (r.is_locator) return lang === "es" ? "Buscador local" : "Local finder";
+
   // In our DB: 3=county, 2=region, 1=statewide
-  if (rank >= 3) return lang === "es" ? "Cerca (condado)" : "Near you (county)";
-  if (rank === 2) return lang === "es" ? "Su región" : "Your region";
+  if (r.match_rank >= 3) return lang === "es" ? "Cerca (condado)" : "Near you (county)";
+  if (r.match_rank === 2) return lang === "es" ? "Su región" : "Your region";
   return lang === "es" ? "Estatal" : "Statewide";
 }
 
@@ -107,6 +123,8 @@ const I18N = {
     whereYouAre: "Where are you in Texas?",
     countyLabel: "County",
     countyPlaceholder: "Start typing your county…",
+    zipLabel: "ZIP code (optional, helps local finders)",
+    zipPlaceholder: "e.g., 77030",
     regionLabel: "Region (helps us prioritize local resources)",
     regionAuto: "Pick from list",
     regionOther: "Other",
@@ -121,22 +139,23 @@ const I18N = {
     situationHint:
       "Pick one for step-by-step guidance. If you’re not sure, you can skip and just browse resources.",
     browseOnly: "Skip (show resources)",
-    showResults: "Find resources",
     updating: "Searching…",
     noResults:
-      "No matches found for this county/region yet. We’ll show statewide resources and a deep local search option.",
+      "No matches found for this county/region yet. We’ll show statewide resources and local finders (directory tools).",
     deepSearchTitle: "Deep local search (Texas)",
     deepSearchBody:
-      "If you need more local options (county programs, nonprofits, church funds, transportation vouchers), 2-1-1 Texas can locate programs near you and tell you exactly what documents you’ll need.",
+      "For county programs and local nonprofits, 2-1-1 Texas can locate services near you and tell you what documents you’ll need.",
     call211: "Call 2-1-1 Texas",
     open211: "Open 2-1-1 Texas",
     nextStepsTitle: "Next steps",
     resourcesTitle: "Resources",
     verified: "Last verified",
     sources: "Source",
+    report: "Report an issue",
+    reportHint:
+      "If a phone number is wrong, link is broken, or eligibility changed, you can report it so we can keep the directory accurate.",
     disclaimer:
       "This tool is for navigation and information only. For emergencies, call 911. Program eligibility and availability can change—always confirm details with the program.",
-    buildMore: "Build a guided plan",
     filters: {
       label: "Filter",
       all: "All",
@@ -156,6 +175,8 @@ const I18N = {
     whereYouAre: "¿Dónde está en Texas?",
     countyLabel: "Condado",
     countyPlaceholder: "Empiece a escribir su condado…",
+    zipLabel: "Código postal (opcional; ayuda con buscadores locales)",
+    zipPlaceholder: "Ej., 77030",
     regionLabel: "Región (ayuda a priorizar recursos locales)",
     regionAuto: "Elegir de lista",
     regionOther: "Otro",
@@ -170,22 +191,23 @@ const I18N = {
     situationHint:
       "Elija una opción para ver pasos guiados. Si no está seguro, puede omitir y ver recursos.",
     browseOnly: "Omitir (mostrar recursos)",
-    showResults: "Buscar recursos",
     updating: "Buscando…",
     noResults:
-      "No encontramos coincidencias para este condado/región. Mostraremos recursos estatales y una opción de búsqueda local.",
+      "No encontramos coincidencias para este condado/región. Mostraremos recursos estatales y buscadores locales (directorios).",
     deepSearchTitle: "Búsqueda local profunda (Texas)",
     deepSearchBody:
-      "Si necesita más opciones locales (programas del condado, organizaciones sin fines de lucro, fondos de iglesias, vales de transporte), 2-1-1 Texas puede encontrar programas cerca de usted e indicarle qué documentos necesita.",
+      "Para programas del condado y organizaciones locales, 2-1-1 Texas puede encontrar servicios cerca de usted e indicarle qué documentos necesita.",
     call211: "Llamar a 2-1-1 Texas",
     open211: "Abrir 2-1-1 Texas",
     nextStepsTitle: "Próximos pasos",
     resourcesTitle: "Recursos",
     verified: "Última verificación",
     sources: "Fuente",
+    report: "Reportar un problema",
+    reportHint:
+      "Si un número está mal, el enlace no funciona o la elegibilidad cambió, repórtelo para mantener el directorio actualizado.",
     disclaimer:
       "Esta herramienta es solo para navegación e información. En emergencias, llame al 911. La elegibilidad y disponibilidad pueden cambiar—confirme siempre con el programa.",
-    buildMore: "Crear un plan guiado",
     filters: {
       label: "Filtrar",
       all: "Todo",
@@ -206,7 +228,8 @@ export default function Page() {
   const [countyMode, setCountyMode] = useState<"pick" | "other">("pick");
   const [selectedCounty, setSelectedCounty] = useState<string>("");
   const [otherCounty, setOtherCounty] = useState<string>("");
-  const [region, setRegion] = useState<TxRegion>("Other/Unknown");
+  const [region, setRegion] = useState<string>("Other/Unknown");
+  const [zip, setZip] = useState<string>("");
 
   // Intent
   const [category, setCategory] = useState<CategoryKey>("bills_coverage");
@@ -223,6 +246,24 @@ export default function Page() {
   const [rankFilter, setRankFilter] = useState<"all" | 3 | 2 | 1>("all");
   const [textFilter, setTextFilter] = useState<string>("");
 
+  // Load persisted ZIP
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("txsn_zip");
+      if (saved) setZip(saved);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("txsn_zip", zip);
+    } catch {
+      // ignore
+    }
+  }, [zip]);
+
   const countyEffective = useMemo(() => {
     const c = countyMode === "pick" ? selectedCounty : otherCounty;
     return c.trim();
@@ -236,7 +277,17 @@ export default function Page() {
     return region === "Other/Unknown" ? "" : region;
   }, [countyMode, counties, selectedCounty, region]);
 
-  const categoryLabel = t.categories[category];
+  const regionOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const row of counties) {
+      const r = (row.region_name ?? "").trim();
+      if (r) s.add(r);
+    }
+    const list = Array.from(s).sort((a, b) => a.localeCompare(b));
+    // Always keep an escape hatch
+    return [...list, "Other/Unknown"];
+  }, [counties]);
+
 
   // Load counties
   useEffect(() => {
@@ -361,32 +412,19 @@ export default function Page() {
     }
   }
 
-  // Auto-search after selections change (lightweight):
-  // - triggers once initial county loads
-  // - triggers on category / playbook / county change
+  // Auto-search after selections change
   const autoSearchKey = useMemo(() => {
     return `${category}::${countyEffective}::${regionEffective}::${selectedPlaybookId ?? "none"}`;
   }, [category, countyEffective, regionEffective, selectedPlaybookId]);
 
   useEffect(() => {
-    // Don’t run until we have some location context.
     if (!countyEffective && !regionEffective) return;
-    // Debounce a bit to avoid hammering while user clicks.
     const tmr = setTimeout(() => {
       runSearch();
     }, 250);
     return () => clearTimeout(tmr);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoSearchKey]);
-
-  const heroBadge = useMemo(() => {
-    const where = countyEffective
-      ? `${countyEffective}${regionEffective ? ` • ${regionEffective}` : ""}`
-      : regionEffective
-        ? regionEffective
-        : "Texas";
-    return `${categoryLabel} • ${where}`;
-  }, [countyEffective, regionEffective, categoryLabel]);
 
   const filteredResources = useMemo(() => {
     const s = textFilter.trim().toLowerCase();
@@ -399,6 +437,31 @@ export default function Page() {
     });
   }, [resources, rankFilter, textFilter]);
 
+  const context = useMemo(
+    () => ({ county: countyEffective, region: regionEffective, zip: zip.trim() }),
+    [countyEffective, regionEffective, zip],
+  );
+
+  async function submitFeedback(resourceId: string, issueType: FeedbackIssue, message: string) {
+    const payload = {
+      resource_id: resourceId,
+      county_name: countyEffective || null,
+      region_name: regionEffective || null,
+      zip: zip.trim() || null,
+      issue_type: issueType,
+      message: message || null,
+      language: lang,
+    };
+
+    const { error } = await supabase.from("resource_feedback").insert(payload);
+    if (error) {
+      console.error(error);
+      alert("Could not submit feedback. Please try again later.");
+      return;
+    }
+    alert(lang === "es" ? "Gracias. Su reporte fue enviado." : "Thanks — your report was submitted.");
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-white to-slate-50">
       <div className="mx-auto max-w-6xl px-6 py-10">
@@ -407,9 +470,6 @@ export default function Page() {
             <div>
               <h1 className="text-3xl font-semibold tracking-tight text-slate-900">{t.appTitle}</h1>
               <p className="mt-2 max-w-2xl text-slate-600">{t.appSubtitle}</p>
-              <div className="mt-4 inline-flex items-center gap-2 rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
-                <span>{heroBadge}</span>
-              </div>
             </div>
 
             <div className="w-full sm:w-auto">
@@ -504,10 +564,10 @@ export default function Page() {
                     <label className="mt-4 block text-sm font-medium text-slate-800">{t.regionLabel}</label>
                     <select
                       value={region}
-                      onChange={(e) => setRegion(e.target.value as TxRegion)}
+                      onChange={(e) => setRegion(e.target.value)}
                       className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm outline-none focus:border-slate-400"
                     >
-                      {TX_REGIONS.map((r) => (
+                      {regionOptions.map((r) => (
                         <option key={r} value={r}>
                           {r}
                         </option>
@@ -518,234 +578,199 @@ export default function Page() {
                     </div>
                   </div>
                 )}
-              </div>
 
-              <hr className="my-6 border-slate-100" />
+                <div className="mt-4">
+                  <label className="block text-sm font-medium text-slate-800">{t.zipLabel}</label>
+                  <input
+                    value={zip}
+                    onChange={(e) => setZip(e.target.value)}
+                    placeholder={t.zipPlaceholder}
+                    inputMode="numeric"
+                    className="mt-2 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm outline-none focus:border-slate-400"
+                  />
+                  <div className="mt-2 text-xs text-slate-500">
+                    Local finders can use ZIP/county to show nearby programs. (Optional.)
+                  </div>
+                </div>
 
-              <div>
-                <label className="block text-sm font-medium text-slate-800">{t.categoryLabel}</label>
-                <div className="mt-2 grid grid-cols-1 gap-2">
-                  {(Object.keys(t.categories) as CategoryKey[]).map((key) => (
+                {/* Category */}
+                <div className="mt-6">
+                  <label className="block text-sm font-medium text-slate-800">{t.categoryLabel}</label>
+                  <div className="mt-2 grid gap-2">
+                    {(["bills_coverage", "meds", "transport"] as CategoryKey[]).map((k) => (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => setCategory(k)}
+                        className={cx(
+                          "w-full rounded-xl border px-3 py-3 text-left text-sm",
+                          category === k
+                            ? "border-slate-900 bg-slate-900 text-white"
+                            : "border-slate-200 bg-white text-slate-800 hover:bg-slate-50",
+                        )}
+                      >
+                        <div className="font-semibold">{t.categories[k]}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Situation */}
+                <div className="mt-6">
+                  <label className="block text-sm font-medium text-slate-800">{t.situationLabel}</label>
+                  <div className="mt-1 text-xs text-slate-500">{t.situationHint}</div>
+                  <div className="mt-2 grid gap-2">
                     <button
-                      key={key}
                       type="button"
-                      onClick={() => setCategory(key)}
+                      onClick={() => setSelectedPlaybookId(null)}
                       className={cx(
-                        "rounded-xl border px-3 py-2 text-left text-sm",
-                        category === key
+                        "w-full rounded-xl border px-3 py-2 text-left text-sm",
+                        selectedPlaybookId === null
                           ? "border-slate-900 bg-slate-900 text-white"
                           : "border-slate-200 bg-white text-slate-800 hover:bg-slate-50",
                       )}
                     >
-                      {t.categories[key]}
+                      {t.browseOnly}
                     </button>
-                  ))}
-                </div>
-              </div>
 
-              <div className="mt-6">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <label className="block text-sm font-medium text-slate-800">{t.situationLabel}</label>
-                    <p className="mt-1 text-xs text-slate-500">{t.situationHint}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedPlaybookId(null)}
-                    className={cx(
-                      "shrink-0 rounded-lg border px-2 py-1 text-xs",
-                      !selectedPlaybookId
-                        ? "border-slate-900 bg-slate-900 text-white"
-                        : "border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
-                    )}
-                  >
-                    {t.browseOnly}
-                  </button>
-                </div>
-
-                <div className="mt-3 grid gap-2">
-                  {playbooks.map((p) => {
-                    const title = lang === "en" ? p.title_en : p.title_es;
-                    const summary = lang === "en" ? p.summary_en : p.summary_es;
-                    const selected = selectedPlaybookId === p.playbook_id;
-                    return (
+                    {playbooks.map((p) => (
                       <button
                         key={p.playbook_id}
                         type="button"
                         onClick={() => setSelectedPlaybookId(p.playbook_id)}
                         className={cx(
-                          "rounded-2xl border p-3 text-left",
-                          selected
+                          "w-full rounded-xl border px-3 py-2 text-left",
+                          selectedPlaybookId === p.playbook_id
                             ? "border-slate-900 bg-slate-900 text-white"
                             : "border-slate-200 bg-white text-slate-800 hover:bg-slate-50",
                         )}
                       >
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="text-sm font-semibold leading-snug">{title}</div>
-                          <span
-                            className={cx(
-                              "rounded-full px-2 py-0.5 text-[11px] font-medium",
-                              selected
-                                ? "bg-white/15 text-white"
-                                : p.urgency_level === "urgent"
-                                  ? "bg-rose-50 text-rose-700"
-                                  : p.urgency_level === "soon"
-                                    ? "bg-amber-50 text-amber-700"
-                                    : "bg-emerald-50 text-emerald-700",
-                            )}
-                          >
-                            {p.urgency_level}
-                          </span>
-                        </div>
-                        <div className={cx("mt-1 text-xs", selected ? "text-white/80" : "text-slate-600")}>
-                          {summary}
+                        <div className="text-sm font-semibold">{lang === "en" ? p.title_en : p.title_es}</div>
+                        <div className={cx("mt-1 text-xs", selectedPlaybookId === p.playbook_id ? "text-slate-200" : "text-slate-600")}>
+                          {lang === "en" ? p.summary_en : p.summary_es}
                         </div>
                       </button>
-                    );
-                  })}
+                    ))}
+                  </div>
+                </div>
 
-                  {playbooks.length === 0 && (
-                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                      No playbooks found for this category yet.
-                    </div>
-                  )}
+                {/* Manual refresh */}
+                <div className="mt-6">
+                  <button
+                    type="button"
+                    onClick={runSearch}
+                    className="w-full rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800"
+                  >
+                    {loading ? t.updating : "Refresh results"}
+                  </button>
+                  {notice ? <div className="mt-3 text-sm text-slate-700">{notice}</div> : null}
                 </div>
               </div>
-
-              <button
-                type="button"
-                onClick={runSearch}
-                disabled={loading}
-                className={cx(
-                  "mt-6 w-full rounded-2xl px-4 py-3 text-sm font-semibold shadow-sm",
-                  loading ? "bg-slate-200 text-slate-600" : "bg-slate-900 text-white hover:bg-slate-800",
-                )}
-              >
-                {loading ? t.updating : t.showResults}
-              </button>
-
-              <p className="mt-4 text-xs text-slate-500">{t.disclaimer}</p>
-
-              <div className="mt-4">
-                <Link href="/wizard" className="inline-flex items-center text-xs font-medium text-slate-700 hover:text-slate-900">
-                  {t.buildMore} →
-                </Link>
-              </div>
             </div>
+
+            {/* Next steps panel */}
+            {selectedPlaybookId && steps.length > 0 && (
+              <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <h3 className="text-sm font-semibold text-slate-900">{t.nextStepsTitle}</h3>
+                <div className="mt-3 grid gap-3">
+                  {steps.map((s) => (
+                    <div key={s.step_id} className="rounded-xl border border-slate-100 bg-slate-50 p-3">
+                      <div className="text-sm font-semibold text-slate-900">
+                        {s.step_order}. {lang === "en" ? s.title_en : s.title_es}
+                      </div>
+                      <div className="mt-1 text-sm text-slate-700">{lang === "en" ? s.body_en : s.body_es}</div>
+                      {s.action_url ? (
+                        <a
+                          href={s.action_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex rounded-lg bg-white px-3 py-2 text-xs font-semibold text-slate-900 shadow-sm ring-1 ring-slate-200 hover:bg-slate-100"
+                        >
+                          {lang === "en" ? s.action_label_en ?? "Open" : s.action_label_es ?? "Abrir"}
+                        </a>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Results */}
           <div className="lg:col-span-2">
-            {selectedPlaybookId && steps.length > 0 && (
-              <section className="mb-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                <h2 className="text-base font-semibold text-slate-900">{t.nextStepsTitle}</h2>
-                <ol className="mt-3 space-y-3">
-                  {steps
-                    .slice()
-                    .sort((a, b) => a.step_order - b.step_order)
-                    .map((s) => {
-                      const title = lang === "en" ? s.title_en : s.title_es;
-                      const body = lang === "en" ? s.body_en : s.body_es;
-                      const actionLabel = lang === "en" ? s.action_label_en : s.action_label_es;
-                      return (
-                        <li key={s.step_id} className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <div className="text-sm font-semibold text-slate-900">
-                                {s.step_order}. {title}
-                              </div>
-                              <div className="mt-1 text-sm text-slate-700">{body}</div>
-                            </div>
-                            {s.action_url && actionLabel && (
-                              <a
-                                href={s.action_url}
-                                className="shrink-0 rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800"
-                                target={s.action_url.startsWith("http") ? "_blank" : undefined}
-                                rel={s.action_url.startsWith("http") ? "noreferrer" : undefined}
-                              >
-                                {actionLabel}
-                              </a>
-                            )}
-                          </div>
-                        </li>
-                      );
-                    })}
-                </ol>
-              </section>
-            )}
-
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h2 className="text-base font-semibold text-slate-900">{t.resourcesTitle}</h2>
                   <p className="mt-1 text-sm text-slate-600">
-                    {categoryLabel}
-                    {countyEffective ? ` • ${countyEffective}` : ""}
-                    {regionEffective ? ` • ${regionEffective}` : ""}
+                    County → region → statewide, plus local directory finders.
                   </p>
                 </div>
-                {notice && (
-                  <div className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-800">{notice}</div>
-                )}
-              </div>
 
-              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className="text-slate-600">{t.filters.label}:</span>
-                  <button
-                    className={cx(
-                      "rounded-full px-3 py-1 ring-1",
-                      rankFilter === "all" ? "bg-slate-900 text-white ring-slate-900" : "bg-white text-slate-700 ring-slate-200",
-                    )}
-                    onClick={() => setRankFilter("all")}
-                    type="button"
-                  >
-                    {t.filters.all}
-                  </button>
-                  <button
-                    className={cx(
-                      "rounded-full px-3 py-1 ring-1",
-                      rankFilter === 3 ? "bg-slate-900 text-white ring-slate-900" : "bg-white text-slate-700 ring-slate-200",
-                    )}
-                    onClick={() => setRankFilter(3)}
-                    type="button"
-                  >
-                    {t.filters.county}
-                  </button>
-                  <button
-                    className={cx(
-                      "rounded-full px-3 py-1 ring-1",
-                      rankFilter === 2 ? "bg-slate-900 text-white ring-slate-900" : "bg-white text-slate-700 ring-slate-200",
-                    )}
-                    onClick={() => setRankFilter(2)}
-                    type="button"
-                  >
-                    {t.filters.region}
-                  </button>
-                  <button
-                    className={cx(
-                      "rounded-full px-3 py-1 ring-1",
-                      rankFilter === 1 ? "bg-slate-900 text-white ring-slate-900" : "bg-white text-slate-700 ring-slate-200",
-                    )}
-                    onClick={() => setRankFilter(1)}
-                    type="button"
-                  >
-                    {t.filters.statewide}
-                  </button>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+                    <button
+                      type="button"
+                      onClick={() => setRankFilter("all")}
+                      className={cx(
+                        "rounded-lg px-3 py-2 text-sm",
+                        rankFilter === "all" ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50",
+                      )}
+                    >
+                      {t.filters.all}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRankFilter(3)}
+                      className={cx(
+                        "rounded-lg px-3 py-2 text-sm",
+                        rankFilter === 3 ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50",
+                      )}
+                    >
+                      {t.filters.county}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRankFilter(2)}
+                      className={cx(
+                        "rounded-lg px-3 py-2 text-sm",
+                        rankFilter === 2 ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50",
+                      )}
+                    >
+                      {t.filters.region}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRankFilter(1)}
+                      className={cx(
+                        "rounded-lg px-3 py-2 text-sm",
+                        rankFilter === 1 ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50",
+                      )}
+                    >
+                      {t.filters.statewide}
+                    </button>
+                  </div>
+
+                  <input
+                    value={textFilter}
+                    onChange={(e) => setTextFilter(e.target.value)}
+                    placeholder={t.filters.search}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm outline-none focus:border-slate-400 sm:w-64"
+                  />
                 </div>
-
-                <input
-                  value={textFilter}
-                  onChange={(e) => setTextFilter(e.target.value)}
-                  placeholder={t.filters.search}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm outline-none focus:border-slate-400 sm:w-64"
-                />
               </div>
 
               <div className="mt-4 grid gap-3">
                 {filteredResources.map((r) => {
-                  const desc = (lang === "en" ? r.description_en : r.description_es) ?? (r.description_en ?? r.description_es ?? "");
+                  const desc =
+                    (lang === "en" ? r.description_en : r.description_es) ??
+                    (r.description_en ?? r.description_es ?? "");
                   const phoneTel = r.phone ? normalizePhoneForTel(r.phone) : null;
+
+                  const website = buildWebsiteUrl(r, context);
+                  const needsZip = !!r.requires_zip;
+                  const zipOk = !needsZip || !!context.zip;
+
                   return (
                     <div key={r.resource_id} className="rounded-2xl border border-slate-100 p-4">
                       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -755,10 +780,12 @@ export default function Page() {
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <span className="rounded-full bg-emerald-50 px-2 py-1 text-[11px] text-emerald-700">
-                            {rankPill(r.match_rank, lang)}
+                            {rankPill(r, lang)}
                           </span>
                           {r.languages && (
-                            <span className="rounded-full bg-slate-50 px-2 py-1 text-[11px] text-slate-700">{r.languages}</span>
+                            <span className="rounded-full bg-slate-50 px-2 py-1 text-[11px] text-slate-700">
+                              {r.languages}
+                            </span>
                           )}
                           {typeof r.link_strength === "number" && (
                             <span className="rounded-full bg-blue-50 px-2 py-1 text-[11px] text-blue-700">
@@ -795,14 +822,23 @@ export default function Page() {
 
                       <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                         <div className="flex flex-wrap gap-2">
-                          {r.website_url && (
+                          {website && (
                             <a
-                              href={r.website_url}
+                              href={website}
                               target="_blank"
                               rel="noreferrer"
-                              className="rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                              aria-disabled={!zipOk}
+                              className={cx(
+                                "rounded-xl px-3 py-2 text-xs font-semibold",
+                                zipOk
+                                  ? "bg-slate-900 text-white hover:bg-slate-800"
+                                  : "bg-slate-200 text-slate-500 cursor-not-allowed",
+                              )}
+                              onClick={(e) => {
+                                if (!zipOk) e.preventDefault();
+                              }}
                             >
-                              Website
+                              {r.is_locator ? (lang === "es" ? "Abrir buscador" : "Open finder") : "Website"}
                             </a>
                           )}
                           {r.phone && phoneTel && (
@@ -813,6 +849,23 @@ export default function Page() {
                               Call {r.phone}
                             </a>
                           )}
+
+                          {/* Simple feedback */}
+                          <button
+                            type="button"
+                            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                            onClick={async () => {
+                              const issue = prompt(
+                                `${t.reportHint}\n\nType one word: broken_link | wrong_phone | not_eligible | closed | other`,
+                              );
+                              if (!issue) return;
+                              const issueType = issue.trim() as FeedbackIssue;
+                              const msg = prompt(lang === "es" ? "Detalles (opcional):" : "Details (optional):") ?? "";
+                              await submitFeedback(r.resource_id, issueType, msg);
+                            }}
+                          >
+                            {t.report}
+                          </button>
                         </div>
 
                         <div className="text-xs text-slate-500">
@@ -831,6 +884,14 @@ export default function Page() {
                           ) : null}
                         </div>
                       </div>
+
+                      {!zipOk && (
+                        <div className="mt-2 text-xs text-amber-700">
+                          {lang === "es"
+                            ? "Ingrese su código postal arriba para usar este buscador local."
+                            : "Enter your ZIP code above to use this local finder."}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -867,6 +928,8 @@ export default function Page() {
                   </a>
                 </div>
               </div>
+
+              <p className="mt-6 text-xs text-slate-500">{t.disclaimer}</p>
             </section>
           </div>
         </div>
